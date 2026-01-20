@@ -1,315 +1,231 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import * as cocoSsd from '@tensorflow-models/coco-ssd';
-import '@tensorflow/tfjs';
-import { speak, stopSpeaking } from '../utils/voice';
-import { estimateDistance, getDetailedPosition, formatDistance } from '../utils/distance';
-import { extractTextFromImage, extractProductInfo, matchProduct } from '../utils/ocr';
-import { createSpeechRecognition } from '../utils/speechRecognition';
 
-interface ProductDetection {
+interface Detection {
   class: string;
   score: number;
   bbox: [number, number, number, number];
+}
+
+interface ProductDetection extends Detection {
   distance: number;
   position: string;
-  ocrText?: string;
-  productInfo?: {
-    brand?: string;
-    productName?: string;
-    size?: string;
-  };
-  matchResult?: {
-    match: boolean;
-    confidence: number;
-    matchedFields: string[];
-  };
 }
 
-interface CartItem {
-  id: string;
-  productName: string;
-  brand?: string;
-  size?: string;
-  detectedAt: number;
-}
+const KNOWN_HEIGHTS: { [key: string]: number } = {
+  person: 1.7,
+  bottle: 0.25,
+  cup: 0.12,
+  bowl: 0.08,
+  'cell phone': 0.15,
+  book: 0.25,
+  laptop: 0.02,
+  mouse: 0.04,
+  keyboard: 0.03,
+  apple: 0.08,
+  banana: 0.2,
+  orange: 0.09,
+  chair: 0.9,
+  'dining table': 0.75,
+  car: 1.5,
+  dog: 0.5,
+  cat: 0.3,
+  backpack: 0.4,
+  handbag: 0.3,
+  tie: 0.4,
+  suitcase: 0.6,
+  frisbee: 0.02,
+  skis: 1.7,
+  snowboard: 1.5,
+  'sports ball': 0.22,
+  kite: 0.8,
+  'baseball bat': 0.85,
+  'baseball glove': 0.25,
+  skateboard: 0.15,
+  surfboard: 2.1,
+  'tennis racket': 0.7,
+  wine: 0.3,
+  fork: 0.18,
+  knife: 0.2,
+  spoon: 0.15,
+  sandwich: 0.08,
+  cake: 0.15,
+  carrot: 0.2,
+  'hot dog': 0.15,
+  pizza: 0.03,
+  donut: 0.08,
+  broccoli: 0.15,
+};
 
-type AppMode = 'intro' | 'search' | 'cartCheck';
-
-interface SmoothedBBox {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
-
-export default function Home() {
-  const [mode, setMode] = useState<AppMode>('intro');
-  const [model, setModel] = useState<cocoSsd.ObjectDetection | null>(null);
+export default function ShelfSight() {
+  const [mode, setMode] = useState<'intro' | 'active'>('intro');
   const [detections, setDetections] = useState<ProductDetection[]>([]);
-  const [searchQuery, setSearchQuery] = useState<string>('');
-  const [isSearching, setIsSearching] = useState(false);
-  const [cartItems, setCartItems] = useState<CartItem[]>([]);
   const [lastAnnouncement, setLastAnnouncement] = useState<{ [key: string]: number }>({});
+  const [currentAnnouncement, setCurrentAnnouncement] = useState<string>('');
   const [tapAnimation, setTapAnimation] = useState(false);
-  const [isListening, setIsListening] = useState(false);
-  const [ocrProcessing, setOcrProcessing] = useState(false);
-  const [lastReadText, setLastReadText] = useState<string>('');
-  const [readItemMode, setReadItemMode] = useState(false);
-
+  const [cameraStatus, setCameraStatus] = useState<string>('Not started');
+  const [model, setModel] = useState<any>(null);
+  const [error, setError] = useState<string>('');
+  const [showPermissionHelp, setShowPermissionHelp] = useState(false);
+  const [isDetecting, setIsDetecting] = useState(false);
+  
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const animationRef = useRef<number>();
   const tapCountRef = useRef(0);
   const tapTimerRef = useRef<NodeJS.Timeout>();
-  const speechRecognitionRef = useRef(createSpeechRecognition());
-  const frameSkipRef = useRef(0);
-  const lastReadTimeRef = useRef<number>(0);
-  const readItemCooldownRef = useRef<number>(0);
-  
-  // Smoothing buffer for bounding boxes
-  const smoothingBuffer = useRef<Map<string, SmoothedBBox[]>>(new Map());
-  const SMOOTHING_FRAMES = 5;
-  const SMOOTHING_ALPHA = 0.3;
-  const FRAME_SKIP = 3; // Process every 3rd frame for performance
+  const animationRef = useRef<number>();
+  const detectionCountRef = useRef(0);
+
+  const speak = useCallback((text: string, interrupt: boolean = false) => {
+    if (typeof window === 'undefined' || !window.speechSynthesis) return;
+
+    if (interrupt) {
+      window.speechSynthesis.cancel();
+    }
+
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 1.0;
+    utterance.pitch = 1.0;
+    utterance.volume = 1.0;
+    
+    utterance.onstart = () => {
+      setCurrentAnnouncement(text);
+      console.log('🔊 Speaking:', text);
+    };
+    
+    utterance.onend = () => {
+      setCurrentAnnouncement('');
+    };
+
+    window.speechSynthesis.speak(utterance);
+  }, []);
 
   useEffect(() => {
     if (mode === 'intro') {
-      const introMessage =
-        'Welcome to ShelfSight. ' +
-        'Hold any item close to the camera and I will read it to you. ' +
-        'Double tap to start.';
       setTimeout(() => {
-        speak(introMessage, true);
+        speak('Welcome to ShelfSight. Double tap to start camera.', true);
       }, 500);
     }
-  }, [mode]);
+  }, [mode, speak]);
 
+  // Load model
   useEffect(() => {
-    if (mode !== 'intro') {
+    if (mode === 'active' && !model) {
+      setCameraStatus('Loading AI model...');
+      speak('Loading detection model...', true);
+      
+      const loadModel = async () => {
+        try {
+          console.log('Loading TensorFlow...');
+          const tf = await import('@tensorflow/tfjs');
+          await tf.ready();
+          console.log('TensorFlow ready, loading COCO-SSD...');
+          const cocoSsd = await import('@tensorflow-models/coco-ssd');
+          const loadedModel = await cocoSsd.load({ base: 'lite_mobilenet_v2' });
+          console.log('✅ Model loaded successfully');
+          setModel(loadedModel);
+          setCameraStatus('Model loaded, ready for camera');
+          speak('Detection model loaded. Ready to scan.', true);
+        } catch (err: any) {
+          console.error('❌ Model load error:', err);
+          setError(`Model error: ${err.message}`);
+          setCameraStatus('Model failed to load');
+          speak('Error loading detection model.', true);
+        }
+      };
+      
       loadModel();
-      startCamera();
     }
+  }, [mode, model, speak]);
 
-    return () => {
-      stopCamera();
-      stopSpeaking();
-      speechRecognitionRef.current.stopListening();
-      if (animationRef.current) {
-        cancelAnimationFrame(animationRef.current);
+  const startCamera = useCallback(async () => {
+    console.log('Starting camera...');
+    setCameraStatus('Requesting camera access...');
+    setError('');
+    setShowPermissionHelp(false);
+
+    try {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        throw new Error('Camera API not available - please use HTTPS or localhost');
       }
-    };
-  }, [mode]);
 
-  const loadModel = async () => {
-    try {
-      const loadedModel = await cocoSsd.load({
-        base: 'lite_mobilenet_v2'
-      });
-      setModel(loadedModel);
-      speak('Detection model loaded. Ready to scan shelves.');
-    } catch (error) {
-      console.error('Error loading model:', error);
-      speak('Error loading detection model');
-    }
-  };
-
-  const startCamera = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
+      const constraints = {
         video: {
           facingMode: 'environment',
           width: { ideal: 1280 },
           height: { ideal: 720 }
         },
         audio: false
-      });
+      };
+
+      console.log('Requesting camera...');
+      setCameraStatus('Waiting for permission...');
+
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      
+      console.log('✅ Camera stream obtained');
+      streamRef.current = stream;
+      setCameraStatus('Camera stream obtained');
 
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
-        streamRef.current = stream;
-        speak('Camera started. Hold an item close to the camera and I will read it to you.');
-      }
-    } catch (error) {
-      console.error('Error accessing camera:', error);
-      speak('Unable to access camera. Please grant camera permissions.');
-    }
-  };
-
-  const stopCamera = () => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop());
-      streamRef.current = null;
-    }
-  };
-
-  const smoothBoundingBox = (key: string, bbox: [number, number, number, number]): SmoothedBBox => {
-    const [x, y, width, height] = bbox;
-    const currentBox = { x, y, width, height };
-    
-    if (!smoothingBuffer.current.has(key)) {
-      smoothingBuffer.current.set(key, []);
-    }
-    
-    const buffer = smoothingBuffer.current.get(key)!;
-    buffer.push(currentBox);
-    
-    if (buffer.length > SMOOTHING_FRAMES) {
-      buffer.shift();
-    }
-    
-    if (buffer.length === 1) {
-      return currentBox;
-    }
-    
-    const smoothed = buffer.reduce((acc, box, idx, arr) => {
-      const weight = idx === arr.length - 1 ? SMOOTHING_ALPHA : (1 - SMOOTHING_ALPHA) / (arr.length - 1);
-      return {
-        x: acc.x + box.x * weight,
-        y: acc.y + box.y * weight,
-        width: acc.width + box.width * weight,
-        height: acc.height + box.height * weight
-      };
-    }, { x: 0, y: 0, width: 0, height: 0 });
-    
-    return smoothed;
-  };
-
-  const readItemInHand = async (
-    detection: ProductDetection,
-    canvas: HTMLCanvasElement
-  ): Promise<void> => {
-    const now = Date.now();
-    // Cooldown to prevent reading the same item repeatedly
-    if (now - lastReadTimeRef.current < 2000) {
-      return;
-    }
-
-    // Extract region of interest for OCR - use the entire detected bounding box
-    const [x, y, width, height] = detection.bbox;
-    const roiX = Math.max(0, Math.floor(x));
-    const roiY = Math.max(0, Math.floor(y));
-    const roiWidth = Math.min(canvas.width - roiX, Math.floor(width));
-    const roiHeight = Math.min(canvas.height - roiY, Math.floor(height));
-
-    // Require minimum size for OCR
-    if (roiWidth < 80 || roiHeight < 80) {
-      return;
-    }
-
-    try {
-      setOcrProcessing(true);
-      const roiCanvas = document.createElement('canvas');
-      roiCanvas.width = roiWidth;
-      roiCanvas.height = roiHeight;
-      const roiCtx = roiCanvas.getContext('2d');
-      
-      if (roiCtx) {
-        roiCtx.drawImage(
-          canvas,
-          roiX, roiY, roiWidth, roiHeight,
-          0, 0, roiWidth, roiHeight
-        );
         
-        const ocrResult = await extractTextFromImage(roiCanvas);
-        const productInfo = extractProductInfo(ocrResult.text);
-        
-        lastReadTimeRef.current = now;
-        
-        // Format the announcement - prioritize readable text
-        let announcement = '';
-        
-        if (ocrResult.text.trim().length > 0) {
-          // If we have product info, use it
-          if (productInfo.brand && productInfo.productName) {
-            announcement = `${productInfo.brand} ${productInfo.productName}`;
-            if (productInfo.size) {
-              announcement += `, ${productInfo.size}`;
-            }
-          } else if (ocrResult.text.trim().length < 150) {
-            // If text is reasonably short, read it directly
-            announcement = ocrResult.text.trim();
-          } else {
-            // If text is long, read first meaningful part
-            const words = ocrResult.text.trim().split(/\s+/).slice(0, 25);
-            announcement = words.join(' ');
-          }
+        videoRef.current.onloadedmetadata = async () => {
+          console.log('✅ Video metadata loaded');
+          setCameraStatus('Video metadata loaded');
           
-          if (announcement) {
-            setLastReadText(announcement);
-            speak(announcement, false);
-          } else {
-            // Fallback to object class
-            speak(`Detected ${detection.class}`, false);
+          try {
+            await videoRef.current!.play();
+            console.log('✅ Video playing');
+            setCameraStatus('✅ Camera active! Detecting objects...');
+            speak('Camera active. Point at objects to identify them.', true);
+            setIsDetecting(true);
+          } catch (playError: any) {
+            console.error('❌ Play error:', playError);
+            setError(`Play error: ${playError.message}`);
+            setCameraStatus('Failed to play video');
           }
-        } else {
-          // No text found, just announce the object type
-          speak(`Detected ${detection.class}`, false);
-        }
-        
-        setOcrProcessing(false);
-      }
-    } catch (error) {
-      console.error('Error reading item:', error);
-      setOcrProcessing(false);
-      // Fallback announcement
-      speak(`Detected ${detection.class}`, false);
-    }
-  };
-
-  const processProductDetection = async (
-    detection: ProductDetection,
-    canvas: HTMLCanvasElement,
-    ctx: CanvasRenderingContext2D
-  ): Promise<ProductDetection> => {
-    if (!searchQuery || mode !== 'search') {
-      return detection;
-    }
-
-    // Extract region of interest for OCR
-    const [x, y, width, height] = detection.bbox;
-    const roiX = Math.max(0, Math.floor(x));
-    const roiY = Math.max(0, Math.floor(y));
-    const roiWidth = Math.min(canvas.width - roiX, Math.floor(width));
-    const roiHeight = Math.min(canvas.height - roiY, Math.floor(height));
-
-    if (roiWidth < 50 || roiHeight < 50) {
-      return detection;
-    }
-
-    try {
-      const roiCanvas = document.createElement('canvas');
-      roiCanvas.width = roiWidth;
-      roiCanvas.height = roiHeight;
-      const roiCtx = roiCanvas.getContext('2d');
-      
-      if (roiCtx) {
-        roiCtx.drawImage(
-          canvas,
-          roiX, roiY, roiWidth, roiHeight,
-          0, 0, roiWidth, roiHeight
-        );
-        
-        const ocrResult = await extractTextFromImage(roiCanvas);
-        const productInfo = extractProductInfo(ocrResult.text);
-        const matchResult = matchProduct(searchQuery, ocrResult.text, productInfo.brand);
-        
-        return {
-          ...detection,
-          ocrText: ocrResult.text,
-          productInfo,
-          matchResult
         };
       }
-    } catch (error) {
-      console.error('OCR processing error:', error);
+    } catch (err: any) {
+      console.error('❌ Camera error:', err);
+      
+      if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
+        setError('Camera permission denied');
+        setCameraStatus('Permission denied');
+        setShowPermissionHelp(true);
+        speak('Camera permission denied. Please grant access.', true);
+      } else if (err.name === 'NotFoundError') {
+        setError('No camera found');
+        setCameraStatus('No camera found');
+        speak('No camera found on this device.', true);
+      } else {
+        setError(`Camera error: ${err.message}`);
+        setCameraStatus('Camera error');
+        speak('Camera error occurred.', true);
+      }
     }
+  }, [speak]);
 
-    return detection;
-  };
+  useEffect(() => {
+    if (mode === 'active' && model) {
+      startCamera();
+    }
+    
+    return () => {
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => track.stop());
+        streamRef.current = null;
+      }
+      if (animationRef.current) {
+        cancelAnimationFrame(animationRef.current);
+      }
+    };
+  }, [mode, model, startCamera]);
 
+  // Detection loop
   const detectObjects = useCallback(async () => {
-    if (!model || !videoRef.current || !canvasRef.current) {
+    if (!model || !videoRef.current || !canvasRef.current || !isDetecting) {
       animationRef.current = requestAnimationFrame(detectObjects);
       return;
     }
@@ -318,123 +234,143 @@ export default function Home() {
     const canvas = canvasRef.current;
     const ctx = canvas.getContext('2d');
 
-    if (!ctx || video.readyState !== 4) {
+    if (!ctx || video.readyState !== 4 || video.paused) {
       animationRef.current = requestAnimationFrame(detectObjects);
       return;
     }
 
-    // Frame skipping for performance
-    frameSkipRef.current++;
-    if (frameSkipRef.current % FRAME_SKIP !== 0) {
-      animationRef.current = requestAnimationFrame(detectObjects);
-      return;
+    if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
+      console.log(`Canvas size set to ${canvas.width}x${canvas.height}`);
     }
 
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-
+    // Draw current video frame
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
-    const predictions = await model.detect(canvas);
+    try {
+      const predictions = await model.detect(canvas);
+      detectionCountRef.current++;
 
-    // ONLY detect objects that are close (in hand) - filter by distance first
-    const detectedObjects: ProductDetection[] = predictions
-      .filter(p => p.score > 0.4) // Lower threshold to catch more items
-      .map(prediction => {
-        const [x, y, width, height] = prediction.bbox;
-        const distance = estimateDistance(
-          prediction.class,
-          height,
-          canvas.height
-        );
-        const centerX = x + width / 2;
-        const centerY = y + height / 2;
-        const position = getDetailedPosition(centerX, centerY, canvas.width, canvas.height);
-
-        return {
-          class: prediction.class,
-          score: prediction.score,
-          bbox: prediction.bbox,
-          distance,
-          position
-        };
-      });
-
-    // ONLY process items that are close (in hand) - distance < 1.2 meters
-    const itemsInHand = detectedObjects.filter(det => det.distance < 1.2);
-    
-    // Update detections to only show items in hand
-    setDetections(itemsInHand);
-
-    // Read the item in hand automatically
-    if (itemsInHand.length > 0 && !ocrProcessing) {
-      // Find the largest/closest object (most likely the main item being held)
-      const itemInHand = itemsInHand.reduce((prev, current) => {
-        const prevSize = prev.bbox[2] * prev.bbox[3];
-        const currentSize = current.bbox[2] * current.bbox[3];
-        // Prefer larger objects, but if similar size, prefer closer
-        if (Math.abs(prevSize - currentSize) < prevSize * 0.2) {
-          return current.distance < prev.distance ? current : prev;
-        }
-        return currentSize > prevSize ? current : prev;
-      });
-      
-      // Read if it's been at least 2 seconds since last read
-      const now = Date.now();
-      if (now - lastReadTimeRef.current > 2000) {
-        readItemInHand(itemInHand, canvas);
+      if (detectionCountRef.current % 30 === 0) {
+        console.log(`Detection #${detectionCountRef.current}: Found ${predictions.length} objects`);
       }
-    }
 
-    // Draw bounding boxes ONLY for items in hand
-    if (itemsInHand.length > 0) {
-      ctx.strokeStyle = '#00ff00';
-      ctx.lineWidth = 4;
-      ctx.font = 'bold 18px Arial';
-      ctx.shadowColor = 'rgba(0, 0, 0, 0.8)';
-      ctx.shadowBlur = 4;
+      const detectedObjects: ProductDetection[] = predictions
+        .filter((p: Detection) => p.score > 0.4)
+        .map((prediction: Detection) => {
+          const [x, y, width, height] = prediction.bbox;
+          const knownHeight = KNOWN_HEIGHTS[prediction.class.toLowerCase()] || 0.3;
+          const distance = (knownHeight * 600) / height;
+          const centerX = x + width / 2;
 
-      itemsInHand.forEach(detection => {
-        const key = `${detection.class}-${Math.floor(detection.bbox[0] / 50)}`;
-        const smoothed = smoothBoundingBox(key, detection.bbox);
+          return {
+            class: prediction.class,
+            score: prediction.score,
+            bbox: prediction.bbox,
+            distance: Math.max(0.3, Math.min(10, distance)),
+            position: centerX < canvas.width * 0.35 ? 'left' : centerX > canvas.width * 0.65 ? 'right' : 'center'
+          };
+        })
+        .sort((a, b) => a.distance - b.distance);
+
+      setDetections(detectedObjects);
+
+      // Redraw video frame
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+
+      // Draw bounding boxes with glowing effect
+      detectedObjects.forEach((det: ProductDetection, index: number) => {
+        const [x, y, width, height] = det.bbox;
         
-        const gradient = ctx.createLinearGradient(
-          smoothed.x, 
-          smoothed.y, 
-          smoothed.x + smoothed.width, 
-          smoothed.y + smoothed.height
-        );
-        gradient.addColorStop(0, '#00ff00');
-        gradient.addColorStop(1, '#00cc00');
+        // Glow effect
+        ctx.shadowColor = index === 0 ? '#00ff00' : '#ffff00';
+        ctx.shadowBlur = 15;
         
-        ctx.strokeStyle = gradient;
-        ctx.strokeRect(smoothed.x, smoothed.y, smoothed.width, smoothed.height);
-
-        const label = detection.class;
-        ctx.font = 'bold 18px Arial';
-        const textWidth = ctx.measureText(label).width;
-
-        ctx.fillStyle = 'rgba(0, 0, 0, 0.9)';
-        ctx.fillRect(smoothed.x, smoothed.y - 30, textWidth + 20, 30);
-
-        ctx.fillStyle = '#00ff00';
-        ctx.fillText(label, smoothed.x + 10, smoothed.y - 8);
+        // Different colors for closest item
+        const isClosest = index === 0;
+        ctx.strokeStyle = isClosest ? '#00ff00' : '#ffff00';
+        ctx.lineWidth = isClosest ? 5 : 3;
         
-        ctx.shadowColor = 'transparent';
+        // Draw rectangle
+        ctx.strokeRect(x, y, width, height);
+        
+        // Reset shadow
         ctx.shadowBlur = 0;
+        
+        // Label background
+        const label = `${det.class} (${det.distance.toFixed(1)}m)`;
+        ctx.font = 'bold 18px Arial';
+        const textMetrics = ctx.measureText(label);
+        const textWidth = textMetrics.width;
+        
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.85)';
+        ctx.fillRect(x, y - 35, textWidth + 20, 35);
+        
+        // Label text
+        ctx.fillStyle = isClosest ? '#00ff00' : '#ffff00';
+        ctx.fillText(label, x + 10, y - 10);
+        
+        // Distance indicator
+        if (isClosest && det.distance < 1.0) {
+          ctx.font = 'bold 14px Arial';
+          ctx.fillStyle = '#00ff00';
+          ctx.fillText('CLOSEST', x + 10, y + height + 25);
+        }
       });
+
+      // Announce closest item
+      if (detectedObjects.length > 0) {
+        announceDetection(detectedObjects[0], false);
+      }
+    } catch (err) {
+      console.error('❌ Detection error:', err);
     }
 
     animationRef.current = requestAnimationFrame(detectObjects);
-  }, [model, ocrProcessing]);
+  }, [model, isDetecting]);
 
   useEffect(() => {
-    if (mode !== 'intro' && model && videoRef.current) {
-      videoRef.current.addEventListener('loadeddata', () => {
-        animationRef.current = requestAnimationFrame(detectObjects);
-      });
+    if (mode === 'active' && model && isDetecting) {
+      console.log('Starting detection loop...');
+      animationRef.current = requestAnimationFrame(detectObjects);
     }
-  }, [mode, model, detectObjects]);
+    
+    return () => {
+      if (animationRef.current) {
+        cancelAnimationFrame(animationRef.current);
+      }
+    };
+  }, [mode, model, isDetecting, detectObjects]);
+
+  const announceDetection = useCallback((detection: ProductDetection, forceAnnounce: boolean = false) => {
+    const now = Date.now();
+    const key = detection.class;
+    const lastTime = lastAnnouncement[key] || 0;
+    
+    // Announce every 3 seconds for same object
+    if (!forceAnnounce && now - lastTime < 3000) {
+      return;
+    }
+    
+    console.log(`📢 Announcing: ${detection.class} at ${detection.distance.toFixed(1)}m`);
+    setLastAnnouncement(prev => ({ ...prev, [key]: now }));
+    
+    let announcement = '';
+    
+    if (detection.distance < 0.5) {
+      announcement = `${detection.class} very close, in your hand`;
+    } else if (detection.distance < 1.0) {
+      announcement = `${detection.class}, ${Math.round(detection.distance * 100)} centimeters away`;
+    } else if (detection.distance < 2.0) {
+      announcement = `${detection.class}, ${detection.distance.toFixed(1)} meters, ${detection.position}`;
+    } else {
+      announcement = `${detection.class} detected, far away`;
+    }
+    
+    speak(announcement, false);
+  }, [lastAnnouncement, speak]);
 
   const handleDoubleTap = () => {
     tapCountRef.current += 1;
@@ -446,9 +382,7 @@ export default function Home() {
 
     if (tapCountRef.current === 2) {
       if (mode === 'intro') {
-        stopSpeaking();
-        setMode('search');
-        speak('Search mode activated. Say "search" followed by the product name to find items, or "cart check" to verify your cart.');
+        setMode('active');
       }
       tapCountRef.current = 0;
     } else {
@@ -459,123 +393,6 @@ export default function Home() {
     }
 
     setTimeout(() => setTapAnimation(false), 300);
-  };
-
-  const handleVoiceCommand = (transcript: string) => {
-    const command = transcript.toLowerCase().trim();
-    
-    if (command.startsWith('search')) {
-      const query = command.replace(/^search\s+/, '');
-      if (query) {
-        setSearchQuery(query);
-        setIsSearching(true);
-        setMode('search');
-        setReadItemMode(false);
-        speak(`Searching for ${query}. Point your camera at the shelf.`);
-      } else {
-        startVoiceSearch();
-      }
-    } else if (command.includes('cart check') || command.includes('check cart')) {
-      setMode('cartCheck');
-      setSearchQuery('');
-      setReadItemMode(false);
-      speak('Cart check mode. Point your camera at your shopping cart to verify items.');
-    } else if (command.includes('read item') || command.includes('read') || command.includes('what is this')) {
-      setReadItemMode(true);
-      setMode('search');
-      speak('Read item mode activated. Hold an item close to the camera and I will read it to you.');
-    } else if (command.includes('clear') || command.includes('reset')) {
-      setSearchQuery('');
-      setIsSearching(false);
-      setReadItemMode(false);
-      speak('Search cleared.');
-    } else if (command) {
-      // Treat as search query
-      setSearchQuery(command);
-      setIsSearching(true);
-      setMode('search');
-      setReadItemMode(false);
-      speak(`Searching for ${command}. Point your camera at the shelf.`);
-    }
-  };
-
-  const startVoiceSearch = () => {
-    if (!speechRecognitionRef.current.isSupported()) {
-      speak('Voice input is not supported in this browser. Please type your search query.');
-      return;
-    }
-
-    setIsListening(true);
-    speak('Listening for your search query...');
-    
-    speechRecognitionRef.current.startListening(
-      (result) => {
-        setIsListening(false);
-        handleVoiceCommand(result);
-      },
-      (error) => {
-        setIsListening(false);
-        speak(`Error with voice input: ${error}`);
-      }
-    );
-  };
-
-  const addToCart = (detection: ProductDetection) => {
-    const cartItem: CartItem = {
-      id: `${Date.now()}-${Math.random()}`,
-      productName: detection.productInfo?.productName || detection.class,
-      brand: detection.productInfo?.brand,
-      size: detection.productInfo?.size,
-      detectedAt: Date.now()
-    };
-    
-    setCartItems(prev => [...prev, cartItem]);
-    speak(`Added ${cartItem.productName} to cart.`);
-  };
-
-  const performCartCheck = async () => {
-    if (!canvasRef.current || cartItems.length === 0) {
-      speak('No items in cart to check.');
-      return;
-    }
-
-    speak('Scanning cart items...');
-    setOcrProcessing(true);
-
-    try {
-      const canvas = canvasRef.current;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
-
-      // Process current frame for cart items
-      const ocrResult = await extractTextFromImage(canvas);
-      const productInfo = extractProductInfo(ocrResult.text);
-
-      // Check each cart item
-      const issues: string[] = [];
-      cartItems.forEach(item => {
-        const match = matchProduct(
-          `${item.brand || ''} ${item.productName}`,
-          ocrResult.text,
-          productInfo.brand
-        );
-
-        if (!match.match) {
-          issues.push(`${item.productName} not found in cart`);
-        }
-      });
-
-      if (issues.length === 0) {
-        speak('Cart check complete. All items verified.');
-      } else {
-        speak(`Cart check found issues: ${issues.join('. ')}`);
-      }
-    } catch (error) {
-      console.error('Cart check error:', error);
-      speak('Error during cart check.');
-    } finally {
-      setOcrProcessing(false);
-    }
   };
 
   if (mode === 'intro') {
@@ -592,162 +409,31 @@ export default function Home() {
           background: 'linear-gradient(135deg, #667eea 0%, #764ba2 50%, #f093fb 100%)',
           padding: '20px',
           cursor: 'pointer',
-          position: 'relative',
-          overflow: 'hidden'
         }}
       >
-        <div
-          style={{
-            position: 'absolute',
-            top: 0,
-            left: 0,
-            right: 0,
-            bottom: 0,
-            background: 'radial-gradient(circle at 50% 50%, rgba(255,255,255,0.1) 0%, transparent 50%)',
-            animation: 'pulse 3s ease-in-out infinite'
-          }}
-        />
-
-        <style>{`
-          @keyframes pulse {
-            0%, 100% { opacity: 0.3; transform: scale(1); }
-            50% { opacity: 0.6; transform: scale(1.05); }
-          }
-          @keyframes float {
-            0%, 100% { transform: translateY(0px); }
-            50% { transform: translateY(-20px); }
-          }
-          @keyframes ripple {
-            0% { transform: scale(0.8); opacity: 1; }
-            100% { transform: scale(2); opacity: 0; }
-          }
-          @keyframes tap-feedback {
-            0% { transform: scale(1); }
-            50% { transform: scale(0.95); }
-            100% { transform: scale(1); }
-          }
-        `}</style>
-
-        {tapAnimation && (
-          <div
-            style={{
-              position: 'absolute',
-              top: '50%',
-              left: '50%',
-              width: '200px',
-              height: '200px',
-              marginLeft: '-100px',
-              marginTop: '-100px',
-              borderRadius: '50%',
-              border: '3px solid rgba(255, 255, 255, 0.8)',
-              animation: 'ripple 0.6s ease-out'
-            }}
-          />
-        )}
-
-        <div style={{
-          animation: 'float 3s ease-in-out infinite',
-          textAlign: 'center',
-          zIndex: 1
-        }}>
-          <h1 style={{
-            fontSize: '4rem',
-            fontWeight: 'bold',
-            marginBottom: '30px',
-            color: '#fff',
-            textShadow: '0 4px 20px rgba(0,0,0,0.3)',
-            letterSpacing: '2px'
-          }}>
-            ShelfSight
-          </h1>
-
-          <div style={{
-            width: '80px',
-            height: '4px',
-            background: 'linear-gradient(90deg, transparent, #fff, transparent)',
-            margin: '20px auto',
-            borderRadius: '2px'
-          }} />
-
-          <p style={{
-            fontSize: '1.8rem',
-            textAlign: 'center',
-            lineHeight: '1.8',
-            maxWidth: '900px',
-            color: '#fff',
-            marginBottom: '20px',
-            textShadow: '0 2px 10px rgba(0,0,0,0.2)'
-          }}>
-            Your Accessible Grocery Shopping Assistant
-          </p>
-
-          <p style={{
-            fontSize: '1.3rem',
-            textAlign: 'center',
-            lineHeight: '1.8',
-            maxWidth: '800px',
-            color: 'rgba(255, 255, 255, 0.9)',
-            marginTop: '20px',
-            textShadow: '0 2px 8px rgba(0,0,0,0.2)'
-          }}>
-            Find products on shelves and verify your cart with confidence
-          </p>
-        </div>
-
+        <h1 style={{ fontSize: '4rem', color: '#fff', marginBottom: '30px' }}>
+          🛒 ShelfSight
+        </h1>
+        <p style={{ fontSize: '1.5rem', color: '#fff', textAlign: 'center', maxWidth: '800px' }}>
+          Your Voice-Guided Grocery Shopping Assistant
+        </p>
         <div style={{
           marginTop: '60px',
           padding: '30px 50px',
           background: 'rgba(255, 255, 255, 0.15)',
           backdropFilter: 'blur(10px)',
           borderRadius: '20px',
-          border: '2px solid rgba(255, 255, 255, 0.3)',
-          boxShadow: '0 8px 32px rgba(0, 0, 0, 0.2)',
-          animation: tapAnimation ? 'tap-feedback 0.3s ease-out' : 'none',
-          zIndex: 1
         }}>
-          <p style={{
-            fontSize: '2rem',
-            textAlign: 'center',
-            color: '#fff',
-            fontWeight: '700',
-            margin: 0,
-            textShadow: '0 2px 10px rgba(0,0,0,0.3)'
-          }}>
+          <p style={{ fontSize: '2rem', color: '#fff', fontWeight: 'bold' }}>
             👆 Double Tap to Start 👆
           </p>
-        </div>
-
-        <div style={{
-          position: 'absolute',
-          bottom: '30px',
-          display: 'flex',
-          gap: '15px'
-        }}>
-          {[0, 1, 2].map((i) => (
-            <div
-              key={i}
-              style={{
-                width: '12px',
-                height: '12px',
-                borderRadius: '50%',
-                background: 'rgba(255, 255, 255, 0.5)',
-                animation: `pulse 2s ease-in-out infinite ${i * 0.3}s`
-              }}
-            />
-          ))}
         </div>
       </div>
     );
   }
 
   return (
-    <div style={{
-      width: '100vw',
-      height: '100vh',
-      position: 'relative',
-      overflow: 'hidden',
-      background: '#000'
-    }}>
+    <div style={{ width: '100vw', height: '100vh', position: 'relative', background: '#000' }}>
       <video
         ref={videoRef}
         autoPlay
@@ -759,7 +445,8 @@ export default function Home() {
           left: 0,
           width: '100%',
           height: '100%',
-          objectFit: 'cover'
+          objectFit: 'cover',
+          display: 'none'
         }}
       />
 
@@ -771,80 +458,165 @@ export default function Home() {
           left: 0,
           width: '100%',
           height: '100%',
-          objectFit: 'cover'
+          objectFit: 'cover',
         }}
       />
 
-      {/* Top Control Bar */}
+      {/* Status Display */}
       <div style={{
         position: 'absolute',
         top: '20px',
         left: '20px',
         right: '20px',
-        background: 'rgba(0, 0, 0, 0.8)',
-        padding: '15px',
-        borderRadius: '12px',
+        background: 'rgba(0, 0, 0, 0.85)',
+        padding: '15px 20px',
+        borderRadius: '15px',
         color: '#fff',
-        backdropFilter: 'blur(5px)',
-        display: 'flex',
-        justifyContent: 'space-between',
-        alignItems: 'center',
-        flexWrap: 'wrap',
-        gap: '10px'
+        zIndex: 10,
+        border: '2px solid rgba(0, 255, 0, 0.3)'
       }}>
-        <div>
-          <h2 style={{ fontSize: '1.3rem', marginBottom: '5px' }}>ShelfSight</h2>
-          <p style={{ fontSize: '0.9rem', color: '#cbd5e1' }}>
-            {ocrProcessing ? 'Reading item...' : 'Hold an item close to read it'}
-          </p>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+          <h2 style={{ fontSize: '1.3rem', margin: 0 }}>🛒 ShelfSight</h2>
+          <div style={{
+            padding: '6px 12px',
+            background: isDetecting ? '#10b981' : '#f59e0b',
+            borderRadius: '20px',
+            fontSize: '0.85rem',
+            fontWeight: 'bold'
+          }}>
+            {isDetecting ? '✅ DETECTING' : '⏳ LOADING'}
+          </div>
         </div>
       </div>
 
-      {/* Last Read Text Display */}
-      {lastReadText && (
+      {/* Permission Help */}
+      {showPermissionHelp && (
         <div style={{
           position: 'absolute',
           top: '100px',
           left: '20px',
           right: '20px',
-          background: 'rgba(156, 39, 176, 0.9)',
-          padding: '15px',
-          borderRadius: '12px',
+          background: 'rgba(239, 68, 68, 0.95)',
+          padding: '25px',
+          borderRadius: '15px',
           color: '#fff',
-          backdropFilter: 'blur(5px)',
-          border: '2px solid rgba(255, 255, 255, 0.3)',
-          boxShadow: '0 4px 20px rgba(0, 0, 0, 0.3)'
+          zIndex: 10,
+          border: '2px solid #fca5a5'
         }}>
-          <p style={{ fontSize: '0.9rem', fontWeight: 'bold', marginBottom: '5px' }}>
-            📖 Last Read:
+          <h3 style={{ fontSize: '1.3rem', marginBottom: '15px', fontWeight: 'bold' }}>
+            📷 Camera Permission Needed
+          </h3>
+          <p style={{ fontSize: '1rem', marginBottom: '15px', lineHeight: 1.6 }}>
+            Click the camera icon in your browser's address bar and select "Allow"
           </p>
-          <p style={{ fontSize: '1rem', lineHeight: '1.4' }}>
-            {lastReadText}
+          <button
+            onClick={startCamera}
+            style={{
+              width: '100%',
+              padding: '15px',
+              fontSize: '1.1rem',
+              fontWeight: 'bold',
+              background: '#fff',
+              color: '#ef4444',
+              border: 'none',
+              borderRadius: '10px',
+              cursor: 'pointer',
+            }}
+          >
+            🔄 Try Again
+          </button>
+        </div>
+      )}
+
+      {/* Current Announcement */}
+      {currentAnnouncement && !showPermissionHelp && (
+        <div style={{
+          position: 'absolute',
+          top: '100px',
+          left: '20px',
+          right: '20px',
+          background: 'rgba(99, 102, 241, 0.95)',
+          padding: '20px',
+          borderRadius: '15px',
+          color: '#fff',
+          zIndex: 10,
+          border: '3px solid #818cf8',
+          animation: 'pulse 2s ease-in-out infinite'
+        }}>
+          <p style={{ fontSize: '0.9rem', fontWeight: 'bold', marginBottom: '8px', opacity: 0.9 }}>
+            🔊 Speaking:
+          </p>
+          <p style={{ fontSize: '1.4rem', fontWeight: 'bold', margin: 0, lineHeight: 1.4 }}>
+            {currentAnnouncement}
           </p>
         </div>
       )}
 
-      {/* Status indicator when no item detected */}
-      {detections.length === 0 && !ocrProcessing && (
-        <div style={{
-          position: 'absolute',
-          bottom: '20px',
-          left: '20px',
-          right: '20px',
-          background: 'rgba(0, 0, 0, 0.7)',
-          padding: '20px',
-          borderRadius: '12px',
-          textAlign: 'center',
-          backdropFilter: 'blur(5px)'
-        }}>
-          <p style={{ fontSize: '1.1rem', color: '#fff', marginBottom: '10px' }}>
-            👋 Hold an item close to the camera
-          </p>
-          <p style={{ fontSize: '0.9rem', color: '#cbd5e1' }}>
-            I will automatically read what you're holding
-          </p>
-        </div>
-      )}
+      {/* Detection Results */}
+      <div style={{
+        position: 'absolute',
+        bottom: '20px',
+        left: '20px',
+        right: '20px',
+        background: 'rgba(0, 0, 0, 0.85)',
+        padding: '20px',
+        borderRadius: '15px',
+        zIndex: 10,
+        border: '2px solid rgba(0, 255, 0, 0.3)'
+      }}>
+        {detections.length > 0 ? (
+          <div>
+            <p style={{ fontSize: '1.1rem', color: '#10b981', fontWeight: 'bold', marginBottom: '15px' }}>
+              ✅ {detections.length} Object{detections.length > 1 ? 's' : ''} Detected
+            </p>
+            {detections.slice(0, 5).map((det, idx) => (
+              <div key={idx} style={{
+                background: idx === 0 ? 'rgba(16, 185, 129, 0.3)' : 'rgba(234, 179, 8, 0.2)',
+                padding: '12px',
+                borderRadius: '10px',
+                marginBottom: '8px',
+                border: idx === 0 ? '2px solid #10b981' : '1px solid rgba(234, 179, 8, 0.5)'
+              }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <p style={{ fontSize: '1.2rem', color: '#fff', fontWeight: 'bold', margin: 0 }}>
+                    {idx === 0 ? '🎯 ' : ''}{det.class}
+                  </p>
+                  <span style={{ 
+                    fontSize: '0.8rem', 
+                    color: idx === 0 ? '#10b981' : '#eab308',
+                    fontWeight: 'bold',
+                    background: 'rgba(0,0,0,0.5)',
+                    padding: '4px 8px',
+                    borderRadius: '5px'
+                  }}>
+                    {(det.score * 100).toFixed(0)}%
+                  </span>
+                </div>
+                <p style={{ fontSize: '0.95rem', color: '#cbd5e1', margin: '5px 0 0 0' }}>
+                  {det.distance < 1 ? `${Math.round(det.distance * 100)} cm` : `${det.distance.toFixed(1)} m`} • {det.position}
+                  {idx === 0 && det.distance < 1.0 && ' • CLOSEST'}
+                </p>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div style={{ textAlign: 'center' }}>
+            <p style={{ fontSize: '1.2rem', color: '#fff', marginBottom: '8px' }}>
+              {isDetecting ? '🔍 Scanning...' : '⏳ Loading...'}
+            </p>
+            <p style={{ fontSize: '0.95rem', color: '#cbd5e1' }}>
+              {isDetecting ? 'Point camera at objects' : 'Please wait'}
+            </p>
+          </div>
+        )}
+      </div>
+
+      <style>{`
+        @keyframes pulse {
+          0%, 100% { opacity: 1; transform: scale(1); }
+          50% { opacity: 0.9; transform: scale(1.02); }
+        }
+      `}</style>
     </div>
   );
 }
