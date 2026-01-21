@@ -4,7 +4,7 @@ export default function Document() {
   return (
     <Html lang="en">
       <Head>
-        <meta name="description" content="TruePath - AR Navigation Assistant for blind and low-vision users" />
+        <meta name="description" content="ShelfSight - AR Navigation Assistant for blind and low-vision users" />
       </Head>
       <body>
         <Main />
